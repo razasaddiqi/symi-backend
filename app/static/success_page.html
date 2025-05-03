@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment Successful</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f5f7fa;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .success-container {
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            padding: 40px;
+            text-align: center;
+            max-width: 500px;
+            width: 90%;
+        }
+        .success-icon {
+            color: #4BB543;
+            font-size: 64px;
+            margin-bottom: 20px;
+        }
+        h1 {
+            color: #2c3e50;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+        .plan-details {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 6px;
+            margin: 20px 0;
+        }
+        .plan-name {
+            font-weight: 600;
+            color: #2c3e50;
+            font-size: 18px;
+        }
+        .return-button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 4px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+            font-weight: 500;
+            margin-top: 10px;
+        }
+        .return-button:hover {
+            background-color: #2980b9;
+        }
+        .session-id {
+            color: #7f8c8d;
+            font-size: 12px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="success-container">
+        <div class="success-icon">✓</div>
+        <h1>Payment Successful!</h1>
+        <p>Your account has been successfully upgraded.</p>
+        
+        <div class="plan-details">
+            <p>You've been upgraded to: <span class="plan-name" id="planName">Premium Plan</span></p>
+        </div>
+        
+        <button class="return-button" id="returnButton">Return to Dashboard</button>
+        
+        <!-- <p class="session-id">Session ID: <span id="sessionId"></span></p> -->
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Parse URL parameters
+            const urlParams = new URLSearchParams(window.location.search);
+            // const sessionId = urlParams.get('session_id');
+            const planName = urlParams.get('plan_name') || 'Premium Plan';
+            
+            // Update the DOM
+            document.getElementById('sessionId').textContent = sessionId || 'N/A';
+            document.getElementById('planName').textContent = planName;
+            
+            // Set up return button
+            document.getElementById('returnButton').addEventListener('click', function() {
+                window.location.href = 'http://localhost:3000/prompt';
+            });
+        });
+    </script>
+</body>
+</html>
