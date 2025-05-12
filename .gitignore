@@ -6,3 +6,10 @@ key.pem
 payment.html
 script to reset database.txt
 add prompts for each profession.txt
+chatbot_ec2_priv_key.ppk
+chatbot_ec2.pem
+db_dump.sql
+db_tables_dumpy.py
+in_it.py
+local_db.dump
+payment.html
