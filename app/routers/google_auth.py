@@ -134,7 +134,7 @@ async def auth_callback(request: Request):
         conn.close()
         
         # Get the frontend URL to redirect to
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        frontend_url = os.getenv("FRONTEND_URL", "https://symi.io")
         next_url = request.session.get("next_url", "/")
         
         # Build the redirect URL with token

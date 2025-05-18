@@ -13,3 +13,5 @@ db_tables_dumpy.py
 in_it.py
 local_db.dump
 payment.html
+app/routers/__pycache__/
+app/__pycache__/

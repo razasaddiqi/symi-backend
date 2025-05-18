@@ -78,14 +78,14 @@
         
         <button class="return-button" id="returnButton">Return to Dashboard</button>
         
-        <!-- <p class="session-id">Session ID: <span id="sessionId"></span></p> -->
+        <p class="session-id">Session ID: <span id="sessionId"></span></p>
     </div>
 
     <script>
         document.addEventListener('DOMContentLoaded', function() {
             // Parse URL parameters
             const urlParams = new URLSearchParams(window.location.search);
-            // const sessionId = urlParams.get('session_id');
+            const sessionId = urlParams.get('session_id');
             const planName = urlParams.get('plan_name') || 'Premium Plan';
             
             // Update the DOM
@@ -94,7 +94,7 @@
             
             // Set up return button
             document.getElementById('returnButton').addEventListener('click', function() {
-                window.location.href = 'http://localhost:3000/prompt';
+                window.location.href = 'https://symi.io/prompt';
             });
         });
     </script>
