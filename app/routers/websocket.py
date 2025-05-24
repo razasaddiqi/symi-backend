@@ -10,32 +10,27 @@ router = APIRouter(tags=["Chat Websocket"])
 
 @router.websocket("/home-chat")
 async def home_websocket_endpoint(websocket: WebSocket):
-    """WebSocket handler for home page demo chat with one-time usage."""
+    """WebSocket handler for home page demo chat - user asks one question, AI responds as business expert."""
     await websocket.accept()
 
     try:
-        # First message should contain token (if user is authenticated) or be empty
-        initial_message = await websocket.receive_text()
-        
         # Track if the user has used their one free message
         free_message_used = False
         
-        # Send initial greeting
-        await websocket.send_json({
-            "type": "message",
-            "content": "Welcome to the Business Transformation Blueprint™ AI Assistant Demo! I can help analyze your business and identify AI-powered transformation opportunities. Ask me anything about optimizing your business operations."
-        })
-
-        # Main chat loop
+        # Import OpenAI client
+        from app.chatbot import client
+        
+        # Main chat loop - wait for user's question
         while True:
             user_message = await websocket.receive_text()
 
             if user_message.lower() == "exit":
                 await websocket.send_json({
                     "type": "message",
-                    "content": "Thank you for trying our demo! For a complete business audit, please sign up for our service.",
+                    "content": "This preview showed you just a fraction of Symi's intelligence. Ready to unlock your complete Business Transformation Blueprint™?",
                     "flags": {
-                        "chatEnded": True
+                        "chatEnded": True,
+                        "isUpgrade": True
                     }
                 })
                 await websocket.send_json({
@@ -49,9 +44,18 @@ async def home_websocket_endpoint(websocket: WebSocket):
             if free_message_used:
                 await websocket.send_json({
                     "type": "message",
-                    "content": "You've used your free demo message. To continue using our AI business assistant and get your complete Business Transformation Blueprint™, please upgrade to a premium plan.",
+                    "content": """That was just a taste of Symi's intelligence. 
+
+                        Your complete Business Transformation Blueprint™ includes:
+                        • Deep business intelligence analysis across 6 core areas
+                        • Custom AI implementation roadmap
+                        • 90-day transformation timeline
+                        • ROI projections and growth strategies
+
+                        Ready to see what Symi can really do for your business?""",
                     "flags": {
-                        "requiresPayment": True
+                        "requiresPayment": True,
+                        "isUpgrade": True
                     }
                 })
                 await websocket.send_json({
@@ -64,27 +68,47 @@ async def home_websocket_endpoint(websocket: WebSocket):
             # Send a "thinking" indication to the client
             await websocket.send_json({
                 "type": "thinking",
-                "message": "Thinking..."
+                "message": "Analyzing your business challenge..."
             })
             
-            # Call OpenAI API for demo response
-            from app.chatbot import client
+            # System prompt for impressive demo that showcases AI intelligence
+            impressive_demo_prompt = """
+            You are Symi, an elite AI business transformation consultant with access to advanced business intelligence. This is a DEMO to showcase your capabilities and impress potential clients.
+
+            Your mission: Provide such an impressive, insightful response that the user will want to buy the premium service immediately.
+
+            Response Structure:
+            1. **INSTANT INSIGHT**: Start with "Based on my analysis of your situation..." - provide a sharp, specific insight that shows you understand their business deeply
             
-            # Simplified system prompt for demo purposes
-            system_content = """
-            You are an AI business consultant specialized in identifying AI-powered transformation opportunities.
+            2. **STRATEGIC BREAKDOWN**: Analyze their question from multiple business angles:
+               - Financial impact
+               - Operational efficiency 
+               - Market positioning
+               - Growth potential
+               - Risk factors
             
-            This is a DEMO conversation, so:
-            1. Keep responses concise (max 3-4 paragraphs)
-            2. Focus on showing how AI can transform business operations
-            3. Highlight the value of a complete business audit
-            4. End your response with a subtle encouragement to sign up for the full service
+            3. **AI-POWERED SOLUTIONS**: Provide 3-4 specific, actionable recommendations with:
+               - Exact implementation steps
+               - Projected ROI/results (be specific with numbers when possible)
+               - Timeline for results
+               - Why this works in their industry/situation
             
-            Remember this is just a demo to showcase capabilities. The full service provides:
-            - Detailed business audit
-            - Custom transformation blueprint
-            - AI implementation roadmap
-            - ROI projections
+            4. **COMPETITIVE ADVANTAGE**: Explain how implementing these solutions will put them ahead of competitors
+            
+            5. **GROWTH PROJECTION**: Give realistic but impressive projections (time saved, revenue increase, efficiency gains)
+            
+            Your tone should be:
+            - Exceptionally knowledgeable and confident
+            - Specific and data-driven (use percentages, timeframes, metrics)
+            - Strategic and forward-thinking
+            - Authoritative but not arrogant
+            - Results-focused
+            
+            Make this response so valuable and insightful that they think "If this is just the demo, imagine what the full service can do!"
+            
+            Length: 400-500 words of pure business intelligence.
+            Use specific business terminology, metrics, and strategic frameworks.
+            Show advanced AI thinking that a human consultant would charge thousands for.
             """
             
             # Get response from OpenAI
@@ -92,9 +116,11 @@ async def home_websocket_endpoint(websocket: WebSocket):
                 response = client.chat.completions.create(
                     model="gpt-4o",
                     messages=[
-                        {"role": "system", "content": system_content},
+                        {"role": "system", "content": impressive_demo_prompt},
                         {"role": "user", "content": user_message}
-                    ]
+                    ],
+                    temperature=0.8,  # Higher creativity for more impressive responses
+                    max_tokens=800    # Allow longer, more detailed responses
                 )
                 
                 bot_content = response.choices[0].message.content
@@ -102,22 +128,46 @@ async def home_websocket_endpoint(websocket: WebSocket):
                 # Mark free message as used
                 free_message_used = True
                 
-                # Send the complete response
+                # Format the AI response with proper markdown and structure
+                formatted_response = f"""## **BUSINESS INTELLIGENCE ANALYSIS**
+
+                {bot_content}
+
+                ---
+
+                ### **This was just 5% of Symi's intelligence capabilities**
+
+                **Your Complete Business Transformation Blueprint™ includes:**
+
+                **Deep Intelligence Analysis**
+                • 6-sector comprehensive business audit  
+                • Advanced competitor intelligence mapping  
+                • Market opportunity identification with ROI projections
+
+                **AI Implementation Roadmap**  
+                • Custom automation system design  
+                • Integration timeline with your existing tools  
+                • Team training and change management protocols
+
+                **Growth Acceleration Framework**  
+                • 90-day transformation timeline  
+                • Monthly milestone tracking  
+                • Performance optimization strategies
+
+                **Revenue Impact Projections**  
+                • Detailed financial modeling  
+                • Cost reduction opportunities  
+                • Revenue stream diversification analysis
+
+                ### **Ready to unlock Symi's full potential for your business?**"""
+                
+                # Send the complete formatted response
                 await websocket.send_json({
                     "type": "message",
-                    "content": bot_content,
+                    "content": formatted_response,
                     "flags": {
                         "isDemo": True,
-                        "trialUsed": True
-                    }
-                })
-                
-                # Show upgrade prompt after sending the response
-                await asyncio.sleep(0.5)  # Small delay before sending follow-up
-                await websocket.send_json({
-                    "type": "message",
-                    "content": "Thank you for trying our demo! To continue using our AI business assistant and get your complete Business Transformation Blueprint™, please upgrade to a premium plan.",
-                    "flags": {
+                        "isComplete": True,
                         "requiresPayment": True
                     }
                 })
@@ -130,7 +180,7 @@ async def home_websocket_endpoint(websocket: WebSocket):
             except Exception as e:
                 await websocket.send_json({
                     "type": "error",
-                    "message": f"Sorry, I encountered an error: {str(e)}"
+                    "message": f"I'm experiencing a temporary issue analyzing your business question. Please try again - I have powerful insights waiting for you."
                 })
 
     except WebSocketDisconnect:
@@ -140,7 +190,7 @@ async def home_websocket_endpoint(websocket: WebSocket):
         print(f"WebSocket error in home demo chat: {str(e)}")
         await websocket.send_json({
             "type": "error",
-            "message": f"Error: {str(e)}"
+            "message": f"Something went wrong. Please refresh and try again. Error: {str(e)}"
         })
         await websocket.send_json({
             "type": "complete",
