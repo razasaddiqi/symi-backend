@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware
 from app.models import create_tables
-from app.routers import google_auth, pricing, profession_prompts, professions, reports, user_profession, users, chats, websocket, admin, payment
+from app.routers import google_auth, pricing, profession_prompts, professions, reports, user_profession, users, chats, websocket, admin, payment, lab_signup
 import os
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -34,6 +34,7 @@ app.include_router(user_profession.router, prefix="/user-profession")
 app.include_router(profession_prompts.router, prefix="/profession-prompts")
 app.include_router(reports.router, prefix="/reports")
 app.include_router(google_auth.router, prefix="/auth")
+app.include_router(lab_signup.router, prefix="/lab")
 
 @app.get("/")
 def root():

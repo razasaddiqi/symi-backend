@@ -21,6 +21,16 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 router = APIRouter(tags=["Payment"])
 
+# Import email functions
+try:
+    from app.routers.lab_signup import send_purchase_notification_email, send_purchase_confirmation_email
+except ImportError:
+    logger.warning("Email functions not available - email notifications will be disabled")
+    def send_purchase_notification_email(*args, **kwargs):
+        return False
+    def send_purchase_confirmation_email(*args, **kwargs):
+        return False
+
 # Request Model for Payment
 class PaymentRequest(BaseModel):
     plan_id: int
@@ -103,8 +113,8 @@ def create_checkout_session(payment: PaymentRequest, token: str):
                 "quantity": 1,
             }],
             mode="payment",
-            success_url=os.getenv("FRONTEND_URL", "https://9640-175-107-235-139.ngrok-free.app") + "/payment/success?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url=os.getenv("FRONTEND_URL", "https://9640-175-107-235-139.ngrok-free.app") + "/payment/cancel",
+            success_url=os.getenv("FRONTEND_URL", "https://api.symi.io") + "/payment/success?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url=os.getenv("FRONTEND_URL", "https://api.symi.io") + "/payment/cancel",
             customer_email=payment.email,
             metadata=metadata,
         )
@@ -156,6 +166,7 @@ def update_payment_status(session_id: str):
         # Get user_id and plan details from metadata
         user_id = session.metadata.get("user_id")
         plan_id = session.metadata.get("plan_id")
+        plan_name = session.metadata.get("plan_name")
         duration_days = int(session.metadata.get("duration_days", 365))
         
         if not user_id or not plan_id:
@@ -191,8 +202,47 @@ def update_payment_status(session_id: str):
             """, (user_id, session_id, session.amount_total, expiry_date, plan_id))
         
         conn.commit()
+        
+        # Get user details for email
+        cursor.execute("SELECT email, username FROM users WHERE id = %s", (user_id,))
+        user_details = cursor.fetchone()
+        
         cursor.close()
         conn.close()
+        
+        if user_details:
+            user_email = user_details[0]
+            user_name = user_details[1]
+            
+            # Convert amount from cents to currency unit
+            plan_price = session.amount_total / 100 if session.amount_total else 0
+            currency = session.currency or 'USD'
+            
+            # Send email notifications
+            try:
+                # Send notification to admin
+                send_purchase_notification_email(
+                    user_email=user_email,
+                    plan_name=plan_name or f"Plan {plan_id}",
+                    plan_price=plan_price,
+                    currency=currency,
+                    user_name=user_name
+                )
+                
+                # Send confirmation to user
+                send_purchase_confirmation_email(
+                    user_email=user_email,
+                    plan_name=plan_name or f"Plan {plan_id}",
+                    plan_price=plan_price,
+                    currency=currency,
+                    user_name=user_name
+                )
+                
+                logger.info(f"Payment emails sent for user {user_id}")
+                
+            except Exception as e:
+                logger.error(f"Failed to send payment emails: {str(e)}")
+                # Don't fail the payment process if emails fail
         
         logger.info(f"Successfully updated payment status for user {user_id} to premium with plan {plan_id}")
         return True
@@ -292,16 +342,17 @@ async def stripe_webhook(request: Request):
         # Get user ID from metadata
         user_id = session.metadata.get("user_id")
         plan_id = session.metadata.get("plan_id")
+        plan_name = session.metadata.get("plan_name")
         
         if not user_id or not plan_id:
             logger.error("No user_id or plan_id found in session metadata")
             return {"message": "Error: No user ID or plan ID in metadata"}
         
-        # Update payment status
+        # Update payment status (this will also send emails)
         success = update_payment_status(session.id)
         
         if success:
-            logger.info(f"Webhook: Payment successful for user {user_id}, plan {plan_id}")
+            logger.info(f"Webhook: Payment successful for user {user_id}, plan {plan_id} ({plan_name})")
             return {"message": f"Payment successfully processed for user {user_id}, plan {plan_id}"}
         else:
             logger.error(f"Webhook: Payment processing failed for user {user_id}, plan {plan_id}")
