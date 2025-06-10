@@ -113,8 +113,8 @@ def create_checkout_session(payment: PaymentRequest, token: str):
                 "quantity": 1,
             }],
             mode="payment",
-            success_url=os.getenv("FRONTEND_URL", "https://api.symi.io") + "/payment/success?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url=os.getenv("FRONTEND_URL", "https://api.symi.io") + "/payment/cancel",
+            success_url=os.getenv("FRONTEND_URL") + "/payment/success?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url=os.getenv("FRONTEND_URL") + "/payment/cancel",
             customer_email=payment.email,
             metadata=metadata,
         )
@@ -141,7 +141,6 @@ def create_checkout_session(payment: PaymentRequest, token: str):
         cursor.close()
         conn.close()
         
-        logger.info(f"Created checkout session {checkout_session.id} for user {user_id}, plan {plan_id} ({plan_name})")
         
         return {
             "checkout_url": checkout_session.url, 
@@ -238,7 +237,6 @@ def update_payment_status(session_id: str):
                     user_name=user_name
                 )
                 
-                logger.info(f"Payment emails sent for user {user_id}")
                 
             except Exception as e:
                 logger.error(f"Failed to send payment emails: {str(e)}")
@@ -254,16 +252,12 @@ def update_payment_status(session_id: str):
 # Success Page that updates payment status
 @router.get("/success")
 async def payment_success(session_id: str, background_tasks: BackgroundTasks):
-    # Process payment update in background to avoid blocking
+
     background_tasks.add_task(update_payment_status, session_id)
     
-    # Retrieve session to get plan details
     try:
         session = stripe.checkout.Session.retrieve(session_id)
-        # plan_name = session.metadata.get("plan_name", "Premium Plan")
-        # plan_id = session.metadata.get("plan_id")
-        
-        # Return the HTML file with parameters in the URL
+
         return FileResponse(
             "app/static/success_page.html", 
             headers={"Content-Disposition": f"inline; filename=success.html"}

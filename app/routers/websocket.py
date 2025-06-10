@@ -1,18 +1,72 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
-from app.chatbot import get_chat_history, process_chat, get_user_profession, has_completed_all_questions
+from app.chatbot import get_chat_history, process_chat, get_user_profession, has_completed_all_questions, stream_chat
 from app.auth import decode_access_token
-from app.database import get_db_connection
+from app.database import get_db_connection_context
 import json
 import asyncio
 from datetime import datetime
+import logging
+from concurrent.futures import ThreadPoolExecutor
+import weakref
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Chat Websocket"])
 
+# Keep track of active connections for monitoring
+active_connections = weakref.WeakSet()
+
+# Thread pool for database operations
+db_executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="websocket_db")
+
+async def get_user_data_async(user_id):
+    """Get user data asynchronously"""
+    loop = asyncio.get_event_loop()
+    
+    def get_user_data():
+        try:
+            with get_db_connection_context() as conn:
+                with conn.cursor() as cursor:
+                    # Check if user is suspended
+                    cursor.execute("SELECT status FROM users WHERE id = %s", (user_id,))
+                    status_result = cursor.fetchone()
+                    
+                    if not status_result:
+                        return {"error": "User not found"}
+                    
+                    if status_result[0] == "suspended":
+                        return {"error": "Account suspended"}
+                    
+                    # Check if user has a profession set
+                    cursor.execute("""
+                        SELECT p.name 
+                        FROM user_profession up
+                        JOIN professions p ON up.profession_id = p.id
+                        WHERE up.user_id = %s
+                    """, (user_id,))
+                    
+                    profession_result = cursor.fetchone()
+                    
+                    if not profession_result:
+                        return {"error": "No profession set"}
+                    
+                    return {
+                        "status": "active",
+                        "profession_name": profession_result[0]
+                    }
+        except Exception as e:
+            logger.error(f"Error getting user data: {e}")
+            return {"error": str(e)}
+    
+    return await loop.run_in_executor(db_executor, get_user_data)
+
 @router.websocket("/home-chat")
 async def home_websocket_endpoint(websocket: WebSocket):
-    """WebSocket handler for home page demo chat - user asks one question, AI responds as business expert."""
+    """WebSocket handler for home page demo chat - optimized for concurrency"""
     await websocket.accept()
-
+    active_connections.add(websocket)
+    
     try:
         # Track if the user has used their one free message
         free_message_used = False
@@ -111,18 +165,22 @@ async def home_websocket_endpoint(websocket: WebSocket):
             Show advanced AI thinking that a human consultant would charge thousands for.
             """
             
-            # Get response from OpenAI
+            # Get response from OpenAI asynchronously
             try:
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": impressive_demo_prompt},
-                        {"role": "user", "content": user_message}
-                    ],
-                    temperature=0.8,  # Higher creativity for more impressive responses
-                    max_tokens=800    # Allow longer, more detailed responses
-                )
+                loop = asyncio.get_event_loop()
                 
+                def get_openai_response():
+                    return client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {"role": "system", "content": impressive_demo_prompt},
+                            {"role": "user", "content": user_message}
+                        ],
+                        temperature=0.8,  # Higher creativity for more impressive responses
+                        max_tokens=800    # Allow longer, more detailed responses
+                    )
+                
+                response = await loop.run_in_executor(db_executor, get_openai_response)
                 bot_content = response.choices[0].message.content
                 
                 # Mark free message as used
@@ -184,25 +242,31 @@ async def home_websocket_endpoint(websocket: WebSocket):
                 })
 
     except WebSocketDisconnect:
-        print("Client disconnected from home demo chat")
+        logger.info("Client disconnected from home demo chat")
 
     except Exception as e:
-        print(f"WebSocket error in home demo chat: {str(e)}")
+        logger.error(f"WebSocket error in home demo chat: {str(e)}")
         await websocket.send_json({
             "type": "error",
-            "message": f"Something went wrong. Please refresh and try again. Error: {str(e)}"
+            "message": f"Something went wrong. Please refresh and try again."
         })
         await websocket.send_json({
             "type": "complete",
             "message": "Demo ended with error"
         })
         await websocket.close()
+    
+    finally:
+        active_connections.discard(websocket)
 
 @router.websocket("/chat")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket handler for real-time chatbot responses without streaming."""
+    """WebSocket handler for real-time chatbot responses - optimized for high concurrency"""
     await websocket.accept()
-
+    active_connections.add(websocket)
+    
+    user_id = None
+    
     try:
         # First message should contain token
         initial_message = await websocket.receive_text()
@@ -227,39 +291,13 @@ async def websocket_endpoint(websocket: WebSocket):
 
         user_id = user["user_id"]
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Check if user is suspended
-        cursor.execute("SELECT status FROM users WHERE id = %s", (user_id,))
-        status = cursor.fetchone()
+        # Get user data asynchronously
+        user_data = await get_user_data_async(user_id)
         
-        if not status or status[0] == "suspended":
-            cursor.close()
-            conn.close()
+        if "error" in user_data:
             await websocket.send_json({
                 "type": "error",
-                "message": "Your account is suspended. Contact admin."
-            })
-            await websocket.close()
-            return
-        
-        # Check if user has a profession set (should be set during signup)
-        cursor.execute("""
-            SELECT p.name 
-            FROM user_profession up
-            JOIN professions p ON up.profession_id = p.id
-            WHERE up.user_id = %s
-        """, (user_id,))
-        
-        profession_result = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        
-        if not profession_result:
-            await websocket.send_json({
-                "type": "error",
-                "message": "No profession is set for your account. This is unusual and might be a system error since profession should be selected during signup."
+                "message": user_data["error"]
             })
             await websocket.close()
             return
@@ -267,10 +305,10 @@ async def websocket_endpoint(websocket: WebSocket):
         # Greeting with profession-specific message
         await websocket.send_json({
             "type": "message",
-            "content": f"Welcome! I'll be asking you specific questions about your {profession_result[0]} business to help provide a customized audit."
+            "content": f"Welcome! I'll be asking you specific questions about your {user_data['profession_name']} business to help provide a customized audit."
         })
 
-        # New variable to track whether chat has ended
+        # Track whether chat has ended
         chat_complete = False
 
         while True:
@@ -283,7 +321,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         "chatComplete": True
                     }
                 })
-                # Send the complete type message to indicate conversation has ended
                 await websocket.send_json({
                     "type": "complete",
                     "message": "Conversation complete"
@@ -301,7 +338,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         "chatEnded": True
                     }
                 })
-                # Send the complete type message to indicate conversation has ended
                 await websocket.send_json({
                     "type": "complete",
                     "message": "Conversation complete"
@@ -309,9 +345,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.close()
                 break
 
-            # Check if user has completed all questions
-            user_profession = get_user_profession(user_id)
-            is_complete = has_completed_all_questions(user_id, user_profession)
+            # Check if user has completed all questions (async)
+            loop = asyncio.get_event_loop()
+            user_profession = await loop.run_in_executor(db_executor, get_user_profession, user_id)
+            is_complete = await loop.run_in_executor(db_executor, has_completed_all_questions, user_id, user_profession)
             
             # If user already completed the audit and says a trigger word like "report" or "generate"
             if is_complete and any(word in user_message.lower() for word in ["report", "generate", "blueprint"]):
@@ -323,7 +360,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         "reportRequested": True
                     }
                 })
-                # Send the complete type message to indicate conversation has ended
                 await websocket.send_json({
                     "type": "complete",
                     "message": "Conversation complete"
@@ -337,8 +373,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 "message": "Thinking..."
             })
             
-            # Get response without streaming
-            response = process_chat(user_id, user_message)
+            # Get response asynchronously
+            response = await process_chat(user_id, user_message)
             
             # Send the complete response
             await websocket.send_json({
@@ -346,8 +382,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 "content": response
             })
             
-            # After response is sent, check if all questions have been answered
-            is_complete_after = has_completed_all_questions(user_id, user_profession)
+            # After response is sent, check if all questions have been answered (async)
+            is_complete_after = await loop.run_in_executor(db_executor, has_completed_all_questions, user_id, user_profession)
             
             # If chat just became complete with this message
             if is_complete_after and not is_complete:
@@ -362,17 +398,40 @@ async def websocket_endpoint(websocket: WebSocket):
                 chat_complete = True
 
     except WebSocketDisconnect:
-        print("Client disconnected")
+        logger.info(f"Client disconnected - User ID: {user_id}")
 
     except Exception as e:
-        print(f"WebSocket error: {str(e)}")
+        logger.error(f"WebSocket error for user {user_id}: {str(e)}")
         await websocket.send_json({
             "type": "error",
             "message": f"Error: {str(e)}"
         })
-        # Send the complete type message even in error case
         await websocket.send_json({
             "type": "complete",
             "message": "Conversation ended with error"
         })
         await websocket.close()
+    
+    finally:
+        active_connections.discard(websocket)
+
+# Monitoring endpoint to check active WebSocket connections
+@router.get("/ws/stats")
+async def websocket_stats():
+    """Get WebSocket connection statistics"""
+    return {
+        "active_connections": len(active_connections),
+        "timestamp": datetime.now().isoformat()
+    }
+
+# Health check for WebSocket service
+@router.get("/ws/health")
+async def websocket_health():
+    """WebSocket service health check"""
+    return {
+        "status": "healthy",
+        "active_connections": len(active_connections),
+        "max_connections": 1000,  # You can adjust this based on your needs
+        "thread_pool_size": db_executor._max_workers,
+        "timestamp": datetime.now().isoformat()
+    }

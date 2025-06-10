@@ -470,11 +470,9 @@ Precision. Intelligence. Evolution."""
             # Build the PDF document
             doc.build(elements)
             
-            # Get the PDF data from the BytesIO buffer
             pdf_data = buffer.getvalue()
             buffer.close()
             
-            logger.info(f"Report generated successfully for user {user_id}")
             return pdf_data
             
         except Exception as e:

@@ -59,7 +59,6 @@ def send_email_notification(subject: str, body: str, recipient_email: str = None
         server.sendmail(sender_email, recipient_email, text)
         server.quit()
         
-        logger.info(f"Email sent successfully to: {recipient_email}")
         return True
         
     except Exception as e:

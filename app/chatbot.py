@@ -5,7 +5,10 @@ import logging
 import asyncio
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from app.database import get_db_connection
+from app.database import get_db_connection_context, get_db_connection, return_db_connection
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import queue
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -18,124 +21,147 @@ openai_api_key = os.getenv("OPENAI_API_KEY")
 # Initialize OpenAI client
 client = openai.OpenAI(api_key=openai_api_key)
 
+# Thread pool for concurrent database operations
+_db_thread_pool = ThreadPoolExecutor(max_workers=10, thread_name_prefix="db_worker")
+
+# Session cache to reduce database hits
+_session_cache = {}
+_cache_lock = threading.Lock()
+
 def is_session_expired(user_id, timeout_minutes=15):
-    """Check if the user's session has expired"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT last_active FROM session_tracker WHERE user_id = %s", (user_id,))
-    row = cursor.fetchone()
+    """Check if the user's session has expired - optimized with caching"""
+    current_time = datetime.utcnow()
     
-    now = datetime.utcnow()
-
-    if row:
-        last_active = row[0]
-        expired = now - last_active > timedelta(minutes=timeout_minutes)
-        if expired:
-            cursor.execute("UPDATE session_tracker SET session_expired = TRUE WHERE user_id = %s", (user_id,))
-        cursor.execute("UPDATE session_tracker SET last_active = %s WHERE user_id = %s", (now, user_id))
-    else:
-        cursor.execute("INSERT INTO session_tracker (user_id, last_active) VALUES (%s, %s)", (user_id, now))
-
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    return row and (now - row[0] > timedelta(minutes=timeout_minutes))
+    # Check cache first
+    with _cache_lock:
+        if user_id in _session_cache:
+            last_active = _session_cache[user_id]
+            if current_time - last_active <= timedelta(minutes=timeout_minutes):
+                # Update cache and return False (not expired)
+                _session_cache[user_id] = current_time
+                return False
+    
+    # Not in cache or expired, check database
+    try:
+        with get_db_connection_context() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT last_active FROM session_tracker WHERE user_id = %s", (user_id,))
+                row = cursor.fetchone()
+                
+                expired = False
+                if row:
+                    last_active = row[0]
+                    expired = current_time - last_active > timedelta(minutes=timeout_minutes)
+                    if expired:
+                        cursor.execute("UPDATE session_tracker SET session_expired = TRUE WHERE user_id = %s", (user_id,))
+                    cursor.execute("UPDATE session_tracker SET last_active = %s WHERE user_id = %s", (current_time, user_id))
+                else:
+                    cursor.execute("INSERT INTO session_tracker (user_id, last_active) VALUES (%s, %s)", (user_id, current_time))
+                
+                conn.commit()
+                
+                # Update cache
+                with _cache_lock:
+                    _session_cache[user_id] = current_time
+                
+                return expired
+                
+    except Exception as e:
+        logger.error(f"Error checking session: {e}")
+        return False
 
 def get_chat_history(user_id, limit=20):
-    """Retrieve the last few chat messages for the user."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute(
-        "SELECT message, response FROM chat_history WHERE user_id = %s ORDER BY timestamp DESC LIMIT %s",
-        (str(user_id), limit)
-    )
-    chats = cursor.fetchall()
-    
-    cursor.close()
-    conn.close()
-    
-    return [{"role": "user", "content": chat[0]} if i % 2 == 0 else {"role": "assistant", "content": chat[1]} for i, chat in enumerate(chats[::-1])]
+    """Retrieve the last few chat messages for the user - thread-safe"""
+    try:
+        with get_db_connection_context() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT message, response FROM chat_history WHERE user_id = %s ORDER BY timestamp DESC LIMIT %s",
+                    (str(user_id), limit)
+                )
+                chats = cursor.fetchall()
+                
+                return [{"role": "user", "content": chat[0]} if i % 2 == 0 else {"role": "assistant", "content": chat[1]} for i, chat in enumerate(chats[::-1])]
+    except Exception as e:
+        logger.error(f"Error getting chat history for user {user_id}: {e}")
+        return []
 
 def get_current_model():
-    """Fetch the chatbot model selected by admin."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    # Ensure the query always retrieves the latest model
-    cursor.execute("SELECT model_name FROM chatbot_settings WHERE id = 1")
-    model = cursor.fetchone()
-
-    cursor.close()
-    conn.close()
-
-    return model[0] if model else "gpt-4o" 
+    """Fetch the chatbot model selected by admin - cached"""
+    # Simple caching for model selection
+    if not hasattr(get_current_model, '_cached_model'):
+        get_current_model._cached_model = None
+        get_current_model._cache_time = 0
+    
+    current_time = datetime.now().timestamp()
+    
+    # Cache model for 5 minutes
+    if get_current_model._cached_model is None or (current_time - get_current_model._cache_time) > 300:
+        try:
+            with get_db_connection_context() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT model_name FROM chatbot_settings WHERE id = 1")
+                    model = cursor.fetchone()
+                    
+                    get_current_model._cached_model = model[0] if model else "gpt-4o"
+                    get_current_model._cache_time = current_time
+        except Exception as e:
+            logger.error(f"Error getting current model: {e}")
+            return "gpt-4o"
+    
+    return get_current_model._cached_model
 
 def get_answered_question_keys(user_id):
     """Get the list of already answered question keys"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT question_key FROM audit_progress WHERE user_id = %s", (user_id,))
-    keys = [row[0] for row in cursor.fetchall()]
-    cursor.close()
-    conn.close()
-    return keys
+    try:
+        with get_db_connection_context() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT question_key FROM audit_progress WHERE user_id = %s", (user_id,))
+                keys = [row[0] for row in cursor.fetchall()]
+                return keys
+    except Exception as e:
+        logger.error(f"Error getting answered questions for user {user_id}: {e}")
+        return []
 
 def get_user_profession(user_id):
-    """Get the user's selected profession and its associated prompt."""
-    logger.info(f"Getting profession for user {user_id}")
+    """Get the user's selected profession and its associated prompt - optimized"""
     
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Get the user's profession (should be set during signup)
-    cursor.execute("""
-        SELECT up.profession_id, p.name, pp.system_prompt
-        FROM user_profession up
-        JOIN professions p ON up.profession_id = p.id
-        LEFT JOIN profession_prompts pp ON pp.profession_id = up.profession_id
-        WHERE up.user_id = %s
-    """, (user_id,))
-    
-    result = cursor.fetchone()
-    logger.info(f"Profession query result: {result[0] if result else None}")
-    
-    cursor.close()
-    conn.close()
-    
-    if not result:
-        logger.info(f"No profession found for user {user_id}")
+    try:
+        with get_db_connection_context() as conn:
+            with conn.cursor() as cursor:
+                # Get the user's profession (should be set during signup)
+                cursor.execute("""
+                    SELECT up.profession_id, p.name, pp.system_prompt
+                    FROM user_profession up
+                    JOIN professions p ON up.profession_id = p.id
+                    LEFT JOIN profession_prompts pp ON pp.profession_id = up.profession_id
+                    WHERE up.user_id = %s
+                """, (user_id,))
+                
+                result = cursor.fetchone()
+                
+                if result[2] is None:
+                    return {
+                        "profession_id": result[0],
+                        "profession_name": result[1],
+                        "system_prompt": None
+                    }
+                
+                return {
+                    "profession_id": result[0],
+                    "profession_name": result[1],
+                    "system_prompt": result[2]
+                }
+    except Exception as e:
+        logger.error(f"Error getting user profession: {e}")
         return None
-    
-    # If no specific prompt exists for this profession, return None for prompt
-    if result[2] is None:
-        logger.info(f"No prompt found for profession {result[0]} ({result[1]})")
-        return {
-            "profession_id": result[0],
-            "profession_name": result[1],
-            "system_prompt": None
-        }
-    
-    logger.info(f"Found prompt for profession {result[0]} ({result[1]})")
-    return {
-        "profession_id": result[0],
-        "profession_name": result[1],
-        "system_prompt": result[2]
-    }
 
 def has_completed_all_questions(user_id, profession):
     """Check if the user has answered all questions for their profession"""
-    # Since we now don't have structured questions in JSON format, 
-    # we'll rely on answered_keys to determine completion status
     answered_keys = get_answered_question_keys(user_id)
-    
-    # If we have at least 15 answered questions, consider the audit complete
-    # This is a simple heuristic and can be adjusted as needed
     completion_threshold = 15
     return len(answered_keys) >= completion_threshold
 
-# Default system prompt (fallback if no profession-specific prompt exists)
 default_system_prompt = """
 You are a highly professional and friendly AI business consultant, specialized in conducting detailed, AI-powered business audits for transformation and optimization.
 
@@ -209,18 +235,11 @@ Be persistent but polite, focused but friendly. Ensure you leave **no question u
 def format_system_prompt(user_profession, answered_keys, is_expired=False):
     """Format the system prompt based on the user's profession and already answered questions."""
     
-    # Log the profession details to debug
-    logger.info(f"Formatting prompt for profession: {user_profession['profession_id'] if user_profession else 'None'}")
-    
-    # Default to generic prompt if user has no profession or if profession has no prompt
     if not user_profession or not user_profession["system_prompt"]:
-        logger.info("Using default system prompt")
         system_prompt = default_system_prompt
     else:
-        logger.info(f"Using profession-specific prompt for {user_profession['profession_name']}")
         system_prompt = user_profession["system_prompt"]
-    
-    # Add information about session status and already answered questions
+
     prefix = ""
     if is_expired:
         prefix = f"""
@@ -237,25 +256,14 @@ def format_system_prompt(user_profession, answered_keys, is_expired=False):
     
     return prefix + system_prompt
 
-def get_openai_response(user_id, user_message):
-    """Get response from OpenAI API"""
+def get_openai_response_sync(user_id, user_message):
+    """Synchronous version of OpenAI response for thread pool execution"""
     model_name = get_current_model()
     chat_history = get_chat_history(user_id)
     answered_keys = get_answered_question_keys(user_id)
-    
-    # Always fetch the fresh user profession data from the database
     user_profession = get_user_profession(user_id)
-    logger.info(f"User {user_id} profession: {user_profession['profession_name'] if user_profession else 'None'}")
-
     expired = is_session_expired(user_id)
-    
-    # Format system prompt based on user's profession and session status
     system_content = format_system_prompt(user_profession, answered_keys, expired)
-    
-    # Log the first part of the system prompt to verify profession
-    logger.info(f"System prompt start: {system_content[:200]}...")
-    
-    # Check if the user is asking for a report after completing all questions
     completed = has_completed_all_questions(user_id, user_profession)
     report_request = "report" in user_message.lower() or "generate" in user_message.lower()
     
@@ -281,38 +289,46 @@ Is there anything specific you'd like to see emphasized in your report?"""
     
     messages = [{"role": "system", "content": system_content}] + chat_history + [{"role": "user", "content": user_message}]
 
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=messages
-    )
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            timeout=30  # Add timeout for better error handling
+        )
 
-    bot_content = response.choices[0].message.content
-    logger.info(f"Bot response start: {bot_content[:100]}...")
-    
-    # If we've completed most/all questions, add a reminder about the report
-    if completed and not report_request and "report" not in bot_content.lower():
-        bot_content += """
+        bot_content = response.choices[0].message.content
+        
+        if completed and not report_request and "report" not in bot_content.lower():
+            bot_content += """
 
 You've provided all the key information needed for your business audit. Would you like me to generate your Business Transformation Blueprint™ report now? This detailed report will provide actionable insights and a transformation roadmap tailored to your business."""
-    
-    return bot_content
+        
+        return bot_content
+        
+    except Exception as e:
+        logger.error(f"Error getting OpenAI response: {e}")
+        return f"I'm experiencing a temporary issue. Please try again in a moment. Error: {str(e)}"
 
-async def stream_chat(user_id, user_message):
-    """Stream response from OpenAI API and save the final complete response"""
+async def get_openai_response(user_id, user_message):
+    """Async wrapper for OpenAI response using thread pool"""
+    loop = asyncio.get_event_loop()
+    try:
+        # Execute the synchronous function in a thread pool
+        response = await loop.run_in_executor(_db_thread_pool, get_openai_response_sync, user_id, user_message)
+        return response
+    except Exception as e:
+        logger.error(f"Error in async OpenAI response: {e}")
+        return f"I'm experiencing a temporary issue. Please try again in a moment."
+
+async def stream_chat_sync(user_id, user_message):
+    """Synchronous streaming chat for thread pool execution"""
     model_name = get_current_model()
     chat_history = get_chat_history(user_id)
     answered_keys = get_answered_question_keys(user_id)
     
-    # Always fetch the fresh user profession data from the database
     user_profession = get_user_profession(user_id)
-    logger.info(f"User {user_id} profession: {user_profession['profession_name'] if user_profession else 'None'}")
-
     expired = is_session_expired(user_id)
-    
-    # Format system prompt based on user's profession and session status
     system_content = format_system_prompt(user_profession, answered_keys, expired)
-    
-    # Check if the user is asking for a report after completing all questions
     completed = has_completed_all_questions(user_id, user_profession)
     report_request = "report" in user_message.lower() or "generate" in user_message.lower()
     
@@ -336,25 +352,10 @@ The report will be tailored specifically to your {user_profession['profession_na
 Is there anything specific you'd like to see emphasized in your report?"""
         
         # Save the complete message to chat history
-        save_chat(user_id, user_message, report_message)
+        save_chat_sync(user_id, user_message, report_message)
         
-        # For report generation, we'll simulate streaming by yielding small chunks
-        # Let OpenAI handle this through its streaming API to maintain consistency
-        messages = [
-            {"role": "system", "content": "You are providing a report generation confirmation."},
-            {"role": "user", "content": "Confirm report generation is ready."}
-        ]
-        
-        stream = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            stream=True,
-            max_tokens=10  # Just need a small response to start the stream
-        )
-        
-        # Stream the report message instead of the actual API response
-        yield report_message
-        return
+        # Return the complete message
+        return report_message
     
     messages = [{"role": "system", "content": system_content}] + chat_history + [{"role": "user", "content": user_message}]
 
@@ -365,21 +366,19 @@ Is there anything specific you'd like to see emphasized in your report?"""
         stream = client.chat.completions.create(
             model=model_name,
             messages=messages,
-            stream=True
+            stream=True,
+            timeout=60
         )
         
-        # Process each chunk as it arrives - let OpenAI handle the chunking
+        # Collect the full response
         for chunk in stream:
             if chunk.choices[0].delta.content is not None:
                 content = chunk.choices[0].delta.content
                 full_response += content
-                # Simply yield each chunk directly as it comes from OpenAI
-                yield content
     
     except Exception as e:
         logger.error(f"Error in streaming response: {str(e)}")
         error_message = f"Sorry, I encountered an error: {str(e)}"
-        yield error_message
         full_response = error_message
     
     # Add report reminder if needed
@@ -388,33 +387,107 @@ Is there anything specific you'd like to see emphasized in your report?"""
 
 You've provided all the key information needed for your business audit. Would you like me to generate your Business Transformation Blueprint™ report now? This detailed report will provide actionable insights and a transformation roadmap tailored to your business."""
         
-        # Add to full response
         full_response += report_reminder
-        # Yield the reminder as a separate chunk
-        yield report_reminder
     
     # Save the complete chat to history
-    save_chat(user_id, user_message, full_response)
+    save_chat_sync(user_id, user_message, full_response)
+    
+    return full_response
 
-def save_chat(user_id, message, response):
-    """Save chat history to database"""
+async def stream_chat(user_id, user_message):
+    """Stream response from OpenAI API and save the final complete response - async version"""
+    loop = asyncio.get_event_loop()
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO chat_history (user_id, message, response) VALUES (%s, %s, %s)",
-            (user_id, message, response)
-        )
-        conn.commit()
-        cursor.close()
-        conn.close()
+        # Execute the synchronous streaming function in a thread pool
+        response = await loop.run_in_executor(_db_thread_pool, stream_chat_sync, user_id, user_message)
+        
+        # Yield the response in chunks for streaming effect
+        words = response.split(' ')
+        current_chunk = ""
+        
+        for word in words:
+            current_chunk += word + " "
+            if len(current_chunk) > 50:  # Send chunks of ~50 characters
+                yield current_chunk
+                current_chunk = ""
+                await asyncio.sleep(0.05)  # Small delay for streaming effect
+        
+        if current_chunk:  # Send remaining content
+            yield current_chunk
+            
+    except Exception as e:
+        logger.error(f"Error in async streaming chat: {e}")
+        yield f"Sorry, I encountered an error: {str(e)}"
+
+def save_chat_sync(user_id, message, response):
+    """Save chat history to database - synchronous version"""
+    try:
+        with get_db_connection_context() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO chat_history (user_id, message, response) VALUES (%s, %s, %s)",
+                    (user_id, message, response)
+                )
+                conn.commit()
     except Exception as e:
         logger.error(f"Error saving chat: {e}")
 
-def process_chat(user_id, user_message):
-    """Handles chat interaction, retrieves chat history, generates response, and saves chat history"""
-    logger.info(f"Processing chat for user {user_id}")
+async def save_chat(user_id, message, response):
+    """Save chat history to database - async version"""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(_db_thread_pool, save_chat_sync, user_id, message, response)
+
+def process_chat_sync(user_id, user_message):
+    """Handles chat interaction synchronously"""
     
-    bot_response = get_openai_response(user_id, user_message)
-    save_chat(user_id, user_message, bot_response)
+    bot_response = get_openai_response_sync(user_id, user_message)
+    save_chat_sync(user_id, user_message, bot_response)
     return bot_response
+
+async def process_chat(user_id, user_message):
+    """Handles chat interaction asynchronously"""
+    
+    bot_response = await get_openai_response(user_id, user_message)
+    await save_chat(user_id, user_message, bot_response)
+    return bot_response
+
+# Keep the original synchronous function for backward compatibility
+def process_chat_original(user_id, user_message):
+    """Original synchronous chat processing for backward compatibility"""
+    return process_chat_sync(user_id, user_message)
+
+# Clear cache periodically to prevent memory leaks
+def clear_session_cache():
+    """Clear old entries from session cache"""
+    with _cache_lock:
+        current_time = datetime.utcnow()
+        expired_keys = []
+        
+        for user_id, last_active in _session_cache.items():
+            if current_time - last_active > timedelta(hours=1):  
+                expired_keys.append(user_id)
+        
+        for key in expired_keys:
+            del _session_cache[key]
+
+# Background task to clear cache periodically
+async def cache_cleanup_task():
+    """Background task to clean up caches"""
+    while True:
+        try:
+            await asyncio.sleep(1800)  # Run every 30 minutes
+            clear_session_cache()
+            
+            # Clear model cache if it's too old
+            if hasattr(get_current_model, '_cache_time'):
+                current_time = datetime.now().timestamp()
+                if (current_time - get_current_model._cache_time) > 3600:  
+                    get_current_model._cached_model = None
+                    
+        except Exception as e:
+            logger.error(f"Error in cache cleanup task: {e}")
+
+# Alias for backward compatibility
+def get_openai_response_original(user_id, user_message):
+    """Original function name for backward compatibility"""
+    return get_openai_response_sync(user_id, user_message)
