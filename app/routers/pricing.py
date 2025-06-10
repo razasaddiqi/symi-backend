@@ -139,7 +139,7 @@ def get_all_pricing_plans():
             SELECT id, name, description, price, currency, duration_days, 
                    features, is_active, display_order
             FROM pricing_plans
-            ORDER BY display_order, name
+            ORDER BY price ASC, display_order, name
         """)
         
         plans = cursor.fetchall()
